@@ -1,143 +1,245 @@
-# FILE: train.py
-
 import torch
-from torch import nn
-import numpy as np
-import torch.utils.data as dutils
-import wandb
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from torchvision import transforms
+from PIL import Image
+import json
+import os
 import subprocess
+from transformers import BertTokenizer, BertModel
+import wandb
 
-from parameters import ACTUAL_STEPS, device, NUM_CHANNELS
-import noise
-import util
-import sample
-import dset
-import model as pixmodel
-from text_embed import get_text_embedding
+# Hyperparameters
+LATENT_DIM = 256
+HIDDEN_DIM = 512
 
-learning_rate = 1e-4
-batch_size = 128
+# Custom dataset
+class Text2ImageDataset(Dataset):
+    def __init__(self, image_dir, metadata_file):
+        self.image_dir = image_dir
+        with open(metadata_file, 'r') as f:
+            self.metadata = json.load(f)
+        self.transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5, 0.5), (0.5, 0.5, 0.5, 0.5))
+        ])
 
-def train(dataloader, model, loss_fn, optimizer):
-    size = len(dataloader.dataset)
-    iters = max(size // batch_size, 1)  # Ensure at least 1 iteration
-    print_on = iters // 3  # Print every third iteration
+    def __len__(self):
+        return len(self.metadata)
 
+    def __getitem__(self, idx):
+        item = self.metadata[idx]
+        image_path = os.path.join(self.image_dir, item['file_name'])
+        image = Image.open(image_path).convert('RGBA')
+        image = self.transform(image)
+        prompt = item['prompt']
+        return image, prompt
+
+# Text encoder
+class TextEncoder(nn.Module):
+    def __init__(self, hidden_size, output_size):
+        super(TextEncoder, self).__init__()
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        self.fc = nn.Linear(self.bert.config.hidden_size, output_size)
+
+    def forward(self, input_ids, attention_mask):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
+        return self.fc(outputs.last_hidden_state[:, 0, :])
+
+# CVAE model
+class CVAE(nn.Module):
+    def __init__(self, text_encoder):
+        super(CVAE, self).__init__()
+        self.text_encoder = text_encoder
+
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Conv2d(4, 32, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 3, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Flatten(),
+            nn.Linear(128 * 2 * 2, HIDDEN_DIM)
+        )
+
+        self.fc_mu = nn.Linear(HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM)
+        self.fc_logvar = nn.Linear(HIDDEN_DIM + HIDDEN_DIM, LATENT_DIM)
+
+        # Decoder
+        self.decoder_input = nn.Linear(LATENT_DIM + HIDDEN_DIM, 128 * 2 * 2)
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 32, 3, stride=2, padding=1, output_padding=1),
+            nn.ReLU(),
+            nn.ConvTranspose2d(32, 4, 3, stride=2, padding=1, output_padding=1),
+            nn.Tanh()
+        )
+
+    def encode(self, x, c):
+        x = self.encoder(x)
+        x = torch.cat([x, c], dim=1)
+        mu = self.fc_mu(x)
+        logvar = self.fc_logvar(x)
+        return mu, logvar
+
+    def decode(self, z, c):
+        z = torch.cat([z, c], dim=1)
+        x = self.decoder_input(z)
+        x = x.view(-1, 128, 2, 2)
+        return self.decoder(x)
+
+    def reparameterize(self, mu, logvar):
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def forward(self, x, c):
+        mu, logvar = self.encode(x, c)
+        z = self.reparameterize(mu, logvar)
+        return self.decode(z, c), mu, logvar
+
+# Loss function
+def loss_function(recon_x, x, mu, logvar):
+    BCE = nn.functional.mse_loss(recon_x, x, reduction='sum')
+    KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
+    return BCE + KLD
+
+# Updated training function
+def train(model, train_loader, optimizer, device, tokenizer):
     model.train()
-    tot_loss = 0
-
-    for batch, (X, prompts) in enumerate(dataloader):
-        B, _, _, _ = X.shape
-        X = (X * 2 - 1).to(device)  # Normalize to [-1, 1]
-
-        t = (torch.rand((B,)) * ACTUAL_STEPS).long().to(device)
-        err, Y = noise.noise(X, t)
-
-        # Get text embeddings
-        text_embeds = get_text_embedding(prompts).to(device)
-        pred = model(Y, t, text_embeds)
-
-        loss = loss_fn(pred, err, t)
-        tot_loss += float(loss)
-
+    train_loss = 0
+    for batch_idx, (data, prompt) in enumerate(train_loader):
+        data = data.to(device)
         optimizer.zero_grad()
+        
+        encoded_input = tokenizer(prompt, padding=True, truncation=True, return_tensors="pt")
+        input_ids = encoded_input['input_ids'].to(device)
+        attention_mask = encoded_input['attention_mask'].to(device)
+        
+        text_encoding = model.text_encoder(input_ids, attention_mask)
+        
+        recon_batch, mu, logvar = model(data, text_encoding)
+        loss = loss_function(recon_batch, data, mu, logvar)
         loss.backward()
+        train_loss += loss.item()
         optimizer.step()
+        
+        # Log batch-level metrics
+        wandb.log({
+            "batch_loss": loss.item(),
+            "batch_reconstruction_loss": nn.functional.mse_loss(recon_batch, data, reduction='mean').item(),
+            "batch_kl_divergence": (-0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp()) / data.size(0)).item()
+        })
     
-    return tot_loss / iters
+    avg_loss = train_loss / len(train_loader.dataset)
+    return avg_loss
 
-def run():
+# Updated main function
+def main():
+
+    NUM_EPOCHS = 150
+    BATCH_SIZE = 128
+    LEARNING_RATE = 1e-4
+
+    # New hyperparameters
+    SAVE_INTERVAL = 25  # Save model every XXX epochs
+    SAVE_INTERVAL_IMAGE = 1 # Save generated image every XXX epochs
+    PROJECT_NAME = "Plixel Items"
+    MODEL_NAME = "Plixel Items"
+    SAVE_DIR = "./models/Minecraft Items - 150 Epoch - Dim Test/"
+
+    tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+
+    if not os.path.exists(SAVE_DIR):
+        os.makedirs(SAVE_DIR)
+
+    DATA_DIR = "./train/"
+    METADATA_FILE = "./train/metadata.json"
+    
+
     # Initialize wandb
-    wandb.init(project="pixart-diffusion", config={
-        "learning_rate": learning_rate,
-        "batch_size": batch_size,
-        "architecture": "UNet"
+    wandb.init(project=PROJECT_NAME, config={
+        "LATENT_DIM": LATENT_DIM,
+        "HIDDEN_DIM": HIDDEN_DIM,
+        "NUM_EPOCHS": NUM_EPOCHS,
+        "BATCH_SIZE": BATCH_SIZE,
+        "LEARNING_RATE": LEARNING_RATE,
+        "SAVE_INTERVAL": SAVE_INTERVAL,
+        "MODEL_NAME": MODEL_NAME
     })
 
-    print("Loading dataset...")
-    dataset = dset.PixDataset(
-        "./train/*.png",
-        "./metadata.json"
-    )
-    print("Loaded dataset of size", len(dataset))
-    train_loader = dutils.DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-    model = pixmodel.UNet().to(device)
-    epoch = 1
-    if args.load_path:
-        epoch = util.load_model(model, args.load_path)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    dataset = Text2ImageDataset(DATA_DIR, METADATA_FILE)
+    train_loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
-    SIMPLE_LOSS = True
-    mse = nn.MSELoss()
+    text_encoder = TextEncoder(hidden_size=HIDDEN_DIM, output_size=HIDDEN_DIM)
+    model = CVAE(text_encoder).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
-    def loss_fn(ims, xs, ts):
-        if SIMPLE_LOSS:
-            return mse(ims, xs)
-        else:
-            loss = mse(ims, xs)
-            alpha = 1 - noise.get_beta(ts)
-            mul = noise.get_beta(ts)**2 / (2 * sample.get_alpha(ts) ** 2 * alpha * (1 - noise.alphat[ts]))
-            return torch.sum(mul * loss)
+    # Log model architecture
+    wandb.watch(model, log="all", log_freq=100)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.999)
-
-    while True:
-        print(f"Epoch {epoch}")
-        print("LR =", scheduler.get_last_lr())
-        loss = train(train_loader, model, loss_fn, optimizer)
-        print("Average loss:", loss)
-
-        # Log metrics to wandb
+    for epoch in range(1, NUM_EPOCHS + 1):
+        train_loss = train(model, train_loader, optimizer, device, tokenizer)
+        print(f'Epoch {epoch}, Loss: {train_loss:.4f}')
+        
+        # Log epoch-level metrics
         wandb.log({
             "epoch": epoch,
-            "loss": loss,
-            "learning_rate": scheduler.get_last_lr()[0]
+            "train_loss": train_loss,
         })
 
-        if args.print_on > 0 and epoch % args.print_on == 0:
-            print("EPOCH", epoch)
-
-        if epoch % args.save_on == 0:
-            print("SAVING MODEL")
-            save_path = f"{args.save_path}{epoch}.pt"
-            util.save_model(model, epoch, save_path)
+        # Generate image and save model every SAVE_INTERVAL epochs
+        if epoch % SAVE_INTERVAL_IMAGE == 0:
+            # Generate image
+            output_image = f"{SAVE_DIR}output_epoch_{epoch}.png"
             
-            # Generate and save image
-            prompt = "diamond chestplate"
-            output_image = f"{args.save_path}{epoch}_epochs.png"
-            subprocess.run([
-                "python", "sample.py", save_path, "16",
-                "-prompt", prompt,
-                "-o", output_image,
-                "-noise_mul", "4"
-            ])
+            # Generate image using the current model state
+            from generate import generate_image
+            prompt = "diamond sword"  # You can change this prompt as needed
+            generated_image = generate_image(model, prompt, device)
+            generated_image.save(output_image)
             
-            # Log the generated image to wandb
+            # Upload generated image to wandb
             wandb.log({
                 "generated_image": wandb.Image(output_image, caption=f"Generated at epoch {epoch} with prompt {prompt}")
             })
+
         
-        if scheduler.get_last_lr()[0] > 1e-5:
-            scheduler.step()
-        
-        epoch += 1
+        if epoch % SAVE_INTERVAL == 0:
+            model_save_path = f"{SAVE_DIR}{MODEL_NAME}_epoch_{epoch}.pth"
+            torch.save(model.state_dict(), model_save_path)
+            print(f"Model saved to {model_save_path}")
+
+        # Log sample reconstructions
+        if epoch % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                sample_data, sample_prompt = next(iter(train_loader))
+                sample_data = sample_data[:4].to(device)  # Take first 4 samples
+                encoded_input = tokenizer(sample_prompt[:4], padding=True, truncation=True, return_tensors="pt")
+                input_ids = encoded_input['input_ids'].to(device)
+                attention_mask = encoded_input['attention_mask'].to(device)
+                text_encoding = model.text_encoder(input_ids, attention_mask)
+                recon_batch, _, _ = model(sample_data, text_encoding)
+                
+                # Denormalize and convert to PIL images
+                original_images = [transforms.ToPILImage()((sample_data[i] * 0.5 + 0.5).cpu()) for i in range(4)]
+                reconstructed_images = [transforms.ToPILImage()((recon_batch[i] * 0.5 + 0.5).cpu()) for i in range(4)]
+                
+                wandb.log({
+                    f"original_vs_reconstructed_{i}": [wandb.Image(original_images[i], caption=f"Original {i}"),
+                                                       wandb.Image(reconstructed_images[i], caption=f"Reconstructed {i}")]
+                    for i in range(4)
+                })
+
+    wandb.finish()
 
 if __name__ == "__main__":
-    # Handle command line arguments
-    import argparse
-
-    parser = argparse.ArgumentParser("train.py")
-    parser.add_argument("-load_path", help="Path to load the model from.", default="", nargs='?')
-    parser.add_argument("-save_path", help="Path to save the model to.", default="", nargs='?')
-    parser.add_argument("-save_on", help="The model is saved every 'save_on' epochs.", default=5, type=int)
-    parser.add_argument("-print_on", help="Updates the loss graph every 'print_on' epochs.", default=25, type=int)
-
-    args = parser.parse_args()
-    assert args.save_on > 0
-
-    if not args.save_path:
-        args.save_path = args.load_path if args.load_path else "pix_model.pt"
-        print("Saving to", args.save_path)
-
-    run()
+    main()
